@@ -1,9 +1,9 @@
-loadstring([[
-    function LPH_NO_VIRTUALIZE(f) return f end
-    function LPH_JIT_MAX(f) return f end
-    function LPH_JIT(f) return f end
-    function LPH_ENCFUNC(f) return f end
-]])();
+-- LPH shims: defined as plain globals so executors that sandbox/disable loadstring still work.
+-- These are no-ops — they just return the function unchanged.
+if not LPH_NO_VIRTUALIZE then LPH_NO_VIRTUALIZE = function(f) return f end end;
+if not LPH_JIT_MAX       then LPH_JIT_MAX       = function(f) return f end end;
+if not LPH_JIT           then LPH_JIT           = function(f) return f end end;
+if not LPH_ENCFUNC       then LPH_ENCFUNC       = function(f) return f end end;
 
 eli_inext = function(t, i)
     i = i + 1;
