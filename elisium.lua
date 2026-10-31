@@ -9487,6 +9487,34 @@ getgenv().elisium = {
         closest_part = false,
     },
 
+    triggerbot = {
+        enable        = false,
+        method        = 'mouse.Target', -- 'mouse.Target' | 'raycast'
+        reaction_time = 0,
+        shoot_delay   = 0,
+        max_distance  = 500,
+        team_check    = true,
+        require_hold  = false,
+    },
+
+    aimlock = {
+        enable          = false,
+        mode            = 'legit',   -- 'legit' | 'ghost'
+        part            = 'Head',
+        smoothing       = 0.18,      -- legit: camera lerp factor per frame (lower = slower)
+        ghost_strength  = 0.55,      -- ghost: lerp per frame (higher = snappier but still disguised)
+        max_angle       = 45,        -- degrees; lock disengages beyond this from crosshair
+        team_check      = true,
+        only_visible    = false,
+        shake_x         = 0.0,       -- legit micro-jitter amplitude (px) — adds human noise
+        shake_y         = 0.0,
+        prediction      = 0.08,      -- seconds of velocity lead
+        toggle_hold     = false,     -- true = hold-to-lock, false = toggle
+        fov_radius      = 160,
+        show_fov        = false,
+        fov_color       = Color3.fromRGB(80, 200, 120),
+    },
+
     auto_vote_map = {
         enable = false,
         map = "",
@@ -12294,6 +12322,21 @@ afov_stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border;
 local afov_fill_gradient = Instance.new("UIGradient", afov);
 local afov_stroke_gradient = Instance.new("UIGradient", afov_stroke);
 
+-- aimlock FOV circle
+local alfov_gui = Instance.new("ScreenGui", gethui());
+alfov_gui.ResetOnSpawn = false;
+alfov_gui.IgnoreGuiInset = true;
+
+local alfov = Instance.new("Frame", alfov_gui);
+alfov.BorderSizePixel = 0;
+alfov.Visible = false;
+alfov.BackgroundTransparency = 1;
+Instance.new("UICorner", alfov).CornerRadius = UDim.new(1, 0);
+local alfov_stroke = Instance.new("UIStroke", alfov);
+alfov_stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border;
+alfov_stroke.Color = ELI.aimlock.fov_color;
+alfov_stroke.Thickness = 1;
+
 local fov_rotation = 0;
 
 local sfov_current_pos = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2);
@@ -12418,6 +12461,20 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     afov_fill_gradient.Rotation = fov_rotation;
     afov_stroke_gradient.Color = a_stroke_gradient;
     afov_stroke_gradient.Rotation = fov_rotation;
+
+    -- aimlock fov circle (simple, no gradient, just a clean ring)
+    if ELI.aimlock.enable and ELI.aimlock.show_fov then
+        local r = ELI.aimlock.fov_radius;
+        local cx = camera.ViewportSize.X / 2;
+        local cy = camera.ViewportSize.Y / 2;
+        alfov.Visible = true;
+        alfov.Size = UDim2.new(0, r * 2, 0, r * 2);
+        alfov.Position = UDim2.new(0, cx - r, 0, cy - r);
+        alfov_stroke.Color = ELI.aimlock.fov_color;
+        alfov_stroke.Thickness = 1;
+    else
+        alfov.Visible = false;
+    end;
 end)));
 
 trove:Add(function()
@@ -12425,6 +12482,9 @@ trove:Add(function()
 end);
 trove:Add(function()
     afov_gui:Destroy();
+end);
+trove:Add(function()
+    alfov_gui:Destroy();
 end);
 
 local deflecting = {};
@@ -12540,6 +12600,237 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
         end;
     end;
 end)));
+
+-- shared keybind state for triggerbot hold-mode (read by backend + UI tab)
+local triggerbot_keybind_active = false;
+
+-- ============================================================
+-- AIMLOCK BACKEND
+-- Two modes:
+--   legit  — slow lerp toward a predicted target position;
+--            optional micro-jitter makes the camera path look
+--            hand-driven; disengages when target leaves fov.
+--   ghost  — faster lerp but only runs on RenderStepped at a
+--            capped rate and adds deliberate micro-drift so
+--            the curve never looks mechanically perfect.
+-- Both modes use camera_controller:MimicRotation so the lock
+-- rides the same path as the native aimbot, staying undetected
+-- by server-side rotation-rate checks.
+-- ============================================================
+
+local aimlock_target      = nil;  -- current locked player
+local aimlock_active      = false; -- actual locked state (respects hold-mode)
+local aimlock_ghost_accum = 0;    -- ghost mode: time accumulator for capped rate
+
+-- target-picker: respects fov_radius, team_check, only_visible
+local function aimlock_getclosest()
+    local cfg   = ELI.aimlock;
+    local best  = math.huge;
+    local found = nil;
+    local center = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2);
+    for _, v in players:GetPlayers() do
+        if v == local_player then continue end;
+        if not v.Character then continue end;
+        local part = v.Character:FindFirstChild(cfg.part)
+                  or v.Character:FindFirstChild('HumanoidRootPart');
+        if not part then continue end;
+        local hum = v.Character:FindFirstChildOfClass('Humanoid');
+        if not hum or hum.Health <= 0 then continue end;
+        if cfg.team_check and v:GetAttribute('TeamID') == local_player:GetAttribute('TeamID') then continue end;
+        if cfg.only_visible and not check_wall(part) then continue end;
+        local pos, onScreen = camera:WorldToViewportPoint(part.Position);
+        if not onScreen then continue end;
+        local dist2d = (center - Vector2.new(pos.X, pos.Y)).Magnitude;
+        if dist2d > cfg.fov_radius then continue end;
+        if dist2d < best then
+            best  = dist2d;
+            found = v;
+        end;
+    end;
+    return found;
+end;
+
+-- angle between current camera look and a world position (degrees)
+local function angle_to_target(worldPos)
+    local camCF = camera.CFrame;
+    local toTarget = (worldPos - camCF.Position).Unit;
+    local lookVec  = camCF.LookVector;
+    local dot = math.clamp(toTarget:Dot(lookVec), -1, 1);
+    return math.deg(math.acos(dot));
+end;
+
+-- legit-mode: runs on Heartbeat, lerps slowly, adds optional micro-jitter
+trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
+    if not ELI.aimlock.enable then return end;
+    if ELI.aimlock.mode ~= 'legit' then return end;
+    if not aimlock_active then return end;
+    if not camera_controller then return end;
+
+    local cfg = ELI.aimlock;
+
+    -- refresh target every frame; drop if dead / left fov
+    local t = aimlock_getclosest();
+    if not t then
+        aimlock_target = nil;
+        return;
+    end;
+    aimlock_target = t;
+
+    local char = t.Character;
+    if not char then return end;
+    local part = char:FindFirstChild(cfg.part) or char:FindFirstChild('HumanoidRootPart');
+    if not part then return end;
+
+    -- velocity prediction: lead the target by cfg.prediction seconds
+    local targetPos = part.Position;
+    local rootPart  = char:FindFirstChild('HumanoidRootPart');
+    if rootPart and cfg.prediction > 0 then
+        local vel = rootPart.AssemblyLinearVelocity;
+        targetPos = targetPos + vel * cfg.prediction;
+    end;
+
+    -- bail if target is outside max_angle — keeps lock "legit" at range
+    if angle_to_target(targetPos) > cfg.max_angle then
+        aimlock_target = nil;
+        return;
+    end;
+
+    -- micro-jitter: tiny random offset each frame to break mechanical linearity
+    local jx = (math.random() - 0.5) * 2 * cfg.shake_x;
+    local jy = (math.random() - 0.5) * 2 * cfg.shake_y;
+    local jitterOffset = camera.CFrame.RightVector * jx + camera.CFrame.UpVector * jy;
+    local aimPos = targetPos + jitterOffset;
+
+    -- smooth camera lerp toward target
+    local alpha = math.min(cfg.smoothing * (dt / 0.016), 1); -- normalise to 60fps
+    local newCF = camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position, aimPos), alpha);
+    pcall(function() camera_controller:MimicRotation(newCF) end);
+end)));
+
+-- ghost-mode: runs on RenderStepped, faster lerp, capped at ~90hz,
+-- deliberate drift between snaps so the curve never looks algorithmic
+trove:Add(run_service.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function(dt)
+    if not ELI.aimlock.enable then return end;
+    if ELI.aimlock.mode ~= 'ghost' then return end;
+    if not aimlock_active then return end;
+    if not camera_controller then return end;
+
+    local cfg = ELI.aimlock;
+
+    -- cap update rate to ~90fps to avoid obvious tick-perfect locking
+    aimlock_ghost_accum = aimlock_ghost_accum + dt;
+    if aimlock_ghost_accum < (1/90) then return end;
+    aimlock_ghost_accum = 0;
+
+    local t = aimlock_getclosest();
+    if not t then aimlock_target = nil; return end;
+    aimlock_target = t;
+
+    local char = t.Character;
+    if not char then return end;
+    local part = char:FindFirstChild(cfg.part) or char:FindFirstChild('HumanoidRootPart');
+    if not part then return end;
+
+    local targetPos = part.Position;
+    local rootPart  = char:FindFirstChild('HumanoidRootPart');
+    if rootPart and cfg.prediction > 0 then
+        targetPos = targetPos + rootPart.AssemblyLinearVelocity * cfg.prediction;
+    end;
+
+    if angle_to_target(targetPos) > cfg.max_angle then
+        aimlock_target = nil;
+        return;
+    end;
+
+    -- ghost micro-drift: small sinusoidal wander so the approach isn't a straight line
+    local t_now = tick();
+    local driftX = math.sin(t_now * 7.3)  * 0.04;
+    local driftY = math.cos(t_now * 5.9)  * 0.03;
+    local driftPos = targetPos
+        + camera.CFrame.RightVector * driftX
+        + camera.CFrame.UpVector   * driftY;
+
+    local alpha = math.min(cfg.ghost_strength * (dt / 0.011), 1);
+    local newCF = camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position, driftPos), alpha);
+    pcall(function() camera_controller:MimicRotation(newCF) end);
+end)));
+
+-- ============================================================
+-- TRIGGERBOT BACKEND
+-- Fires when crosshair is on an enemy — no camera movement.
+-- method 'mouse.Target': reads mouse.Target instance, checks
+--   if it belongs to an enemy character. Zero raycasting load.
+-- method 'raycast': fires from camera center with workspace
+--   RaycastParams so it hits the actual hitbox, not just the
+--   visible mesh. More accurate but slightly heavier.
+-- Both paths respect team_check, max_distance, reaction_time,
+-- and an optional require_hold keybind gate.
+-- ============================================================
+do
+    local tb_fire_pending = false;
+    local tb_last_fire    = 0;
+
+    local function is_enemy(instance)
+        if not instance then return false end;
+        local cfg = ELI.triggerbot;
+        local char = instance.Parent;
+        if not char then return false end;
+        local pl = players:GetPlayerFromCharacter(char);
+        if not pl or pl == local_player then return false end;
+        local hum = char:FindFirstChildOfClass('Humanoid');
+        if not hum or hum.Health <= 0 then return false end;
+        if cfg.team_check
+            and pl:GetAttribute('TeamID') == local_player:GetAttribute('TeamID')
+        then return false end;
+        local root = char:FindFirstChild('HumanoidRootPart');
+        if not root then return false end;
+        if (root.Position - camera.CFrame.Position).Magnitude > cfg.max_distance
+        then return false end;
+        return true;
+    end;
+
+    trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
+        if not ELI.triggerbot.enable then return end;
+        if ELI.triggerbot.require_hold and not triggerbot_keybind_active then return end;
+
+        local now = tick();
+        if tb_fire_pending then return end;
+
+        local on_enemy = false;
+
+        if ELI.triggerbot.method == 'mouse.Target' then
+            -- mouse.Target is the cheapest path; works for most weapons
+            on_enemy = is_enemy(mouse and mouse.Target);
+        else
+            -- raycast from camera center through viewport midpoint
+            local vp = camera.ViewportSize;
+            local ray = camera:ViewportPointToRay(vp.X / 2, vp.Y / 2, 0);
+            local rp  = RaycastParams.new();
+            rp.FilterType = Enum.RaycastFilterType.Exclude;
+            rp.FilterDescendantsInstances = { local_player.Character or {} };
+            local result = workspace:Raycast(
+                ray.Origin,
+                ray.Direction * ELI.triggerbot.max_distance,
+                rp
+            );
+            on_enemy = result and is_enemy(result.Instance) or false;
+        end;
+
+        if on_enemy then
+            tb_fire_pending = true;
+            task.delay(ELI.triggerbot.reaction_time, function()
+                if ELI.triggerbot.enable then
+                    mouse1click(); -- executor global; fires current weapon
+                    task.delay(ELI.triggerbot.shoot_delay, function()
+                        tb_fire_pending = false;
+                    end);
+                else
+                    tb_fire_pending = false;
+                end;
+            end);
+        end;
+    end)));
+end;
 
 trove:Add(run_service.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
     if ELI.slide_boost.enable then
@@ -13713,578 +14004,358 @@ if utility and old_raycast then
     end);
 end;
 
-local legit_tab = Tabs.Main; do
-    local aim_tabs = legit_tab:AddLeftTabbox(); do
-        local silentaim_tab = aim_tabs:AddTab('silent aim'); do
-            local keybind_silent_aim_enable = false;
+-- ============================================================
+-- COMBAT TAB  (Aimbot · Aimlock · Triggerbot)
+-- ============================================================
+local combat_tab = Tabs.Main; do
+    local aim_tabs = combat_tab:AddLeftTabbox(); do
 
-            silentaim_tab:AddToggle('silent_aim_enable', {
-                Text = 'enable',
-                Default = false,
-                Callback = function(v)
-                    keybind_silent_aim_enable = v;
-                    ELI.silent_aim.enable = v;
-                    sfov.Visible = v and ELI.silent_aim.show_fov or false;
-                    Toggles.show_fov_enable:SetVisible(v);
-                end
-            }):AddKeyPicker('silent_aim_keybind', {
-                Default = '...',
-                Text = 'silent aim',
-                NoUI = false,
-                EnableCheck = function()
-                    return ELI.silent_aim.enable;
-                end,
-                Callback = function(v)
-                    ELI.silent_aim.enable = keybind_silent_aim_enable and v or false;
-                    sfov.Visible = ELI.silent_aim.enable and ELI.silent_aim.show_fov or false;
-                end
-            });
-
-            silentaim_tab:AddToggle('closest_part_enable', {
-                Text = 'closest part',
-                Default = false,
-                Callback = function(v)
-                    ELI.silent_aim.closest_part = v;
-                end
-            });
-
-            silentaim_tab:AddToggle('silent_aim_visualize', {
-                Text = 'visualize',
-                Default = false,
-                Callback = function(v)
-                    ELI.silent_aim.visualize = v;
-                end
-            });
-
-            silentaim_tab:AddToggle('show_fov_enable', {
-                Text = 'show fov',
-                Default = false,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.show_fov = v;
-                    sfov.Visible = v and ELI.silent_aim.enable or false;
-                    Options.silent_aim_fov_radius:SetVisible(v);
-                    Options.silent_aim_fov_transparency:SetVisible(v);
-                    Options.silent_aim_fov_thickness:SetVisible(v);
-                    Options.silent_aim_rotation_speed:SetVisible(v);
-                    Toggles.show_fill_enable:SetVisible(v);
-                end
-            }):AddColorPicker('fov_color', {
-                Title = 'fov color',
-                Default = Color3.fromRGB(120, 81, 166),
-                Callback = function(v)
-                    ELI.silent_aim.fov_color = v;
-                end
-            }):AddColorPicker('fov_color2', {
-    Title = 'fov color 2',
-    Default = Color3.fromRGB(255, 255, 255),
-    Callback = function(v)
-        ELI.silent_aim.fov_color2 = v;
-    end
-});
-
-            silentaim_tab:AddToggle('silent_aim_follow_gunpoint', {
-                Text = 'follow gunpoint',
-                Default = false,
-                Callback = function(v)
-                    ELI.silent_aim.follow_gunpoint = v;
-                end
-            });
-
-                        silentaim_tab:AddToggle('silent_aim_follow_target', {
-    Text = 'follow target',
-    Default = false,
-    Callback = function(v)
-        ELI.silent_aim.follow_target = v;
-    end
-});
-
-            silentaim_tab:AddToggle('show_fill_enable', {
-                Text = 'show fill',
-                Default = false,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.show_fill = v;
-                    Options.silent_aim_fill_transparency:SetVisible(v);
-                end
-            }):AddColorPicker('fill_color_primary', {
-                Title = 'fill color',
-                Default = Color3.fromRGB(120, 81, 166),
-                Callback = function(v)
-                    ELI.silent_aim.fov_fill_color = v;
-                end
-            }):AddColorPicker('fill_color_secondary', {
-                Title = 'fill color 2',
-                Default = Color3.fromRGB(255, 255, 255),
-                Callback = function(v)
-                    ELI.silent_aim.fov_fill_color2 = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_fov_radius', {
-                Text = 'radius',
-                Default = 180,
-                Suffix = 'px',
-                Min = 1,
-                Max = 600,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.fov_radius = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_fill_transparency', {
-                Text = 'fill transparency',
-                Default = 0.6,
-                Min = 0,
-                Max = 1,
-                Rounding = 2,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.fov_fill_transparency = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_fov_transparency', {
-                Text = 'fov transparency',
-                Default = 0.2,
-                Min = 0,
-                Max = 1,
-                Rounding = 2,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.fov_outline_transparency = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_fov_thickness', {
-                Text = 'thickness',
-                Default = 2,
-                Min = 1,
-                Max = 10,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.fov_thickness = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_rotation_speed', {
-                Text = 'rotation speed',
-                Default = 90,
-                Min = 0,
-                Max = 360,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.silent_aim.fov_rotation_speed = v;
-                end
-            });
-
-            silentaim_tab:AddSlider('silent_aim_hit_chance', {
-                Text = 'hit chance',
-                Default = 100,
-                Min = 1,
-                Max = 100,
-                Rounding = 0,
-                Callback = function(v)
-                    ELI.silent_aim.hit_chance = v;
-                end
-            });
-
-silentaim_tab:AddSlider('silent_aim_lerp', {
-    Text = 'lerp',
-    Default = 0,
-    Min = 0,
-    Max = 1,
-    Rounding = 2,
-    Callback = function(v)
-        ELI.silent_aim.lerp = v;
-    end
-});
-        end;
-
+        -- ====================================================
+        -- AIMBOT
+        -- moves crosshair to the nearest enemy once per frame
+        -- ====================================================
         local aimbot_tab = aim_tabs:AddTab('aimbot'); do
-            local keybind_aimbot_enable = false;
 
             aimbot_tab:AddToggle('aimbot_enable', {
-                Text = 'enable',
+                Text    = 'enable',
                 Default = false,
                 Callback = function(v)
-                    keybind_aimbot_enable = v;
                     ELI.aimbot.enable = v;
-                    afov.Visible = v and ELI.aimbot.show_fov or false;
-                    Toggles.aimbot_show_fov_enable:SetVisible(v);
+                    if not v then elisium_state.aimbotTarget = nil end;
                 end
             }):AddKeyPicker('aimbot_keybind', {
-                Default = '...',
-                Text = 'aimbot',
-                NoUI = false,
-                EnableCheck = function()
-                    return ELI.aimbot.enable;
-                end,
-                Callback = function(v)
-                    ELI.aimbot.enable = keybind_aimbot_enable and v or false;
-                    afov.Visible = ELI.aimbot.enable and ELI.aimbot.show_fov or false;
-                end
+                Default   = '...',
+                Text      = 'aimbot',
+                NoUI      = false,
+                SyncToggleState = false,
+                Mode      = 'Toggle',
+                EnableCheck = function() return ELI.aimbot.enable end,
+                Callback  = function(v) ELI.aimbot.enable = v end
             });
 
-            aimbot_tab:AddToggle('aimbot_show_fov_enable', {
-                Text = 'show fov',
-                Default = false,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.show_fov = v;
-                    afov.Visible = v and ELI.aimbot.enable or false;
-                    Options.aimbot_fov_radius:SetVisible(v);
-                    Options.aimbot_fov_transparency:SetVisible(v);
-                    Options.aimbot_fov_thickness:SetVisible(v);
-                    Options.aimbot_rotation_speed:SetVisible(v);
-                    Toggles.aimbot_show_fill_enable:SetVisible(v);
-                end
-            }):AddColorPicker('aimbot_fov_color', {
-                Title = 'fov color',
-                Default = Color3.fromRGB(120, 81, 166),
-                Callback = function(v)
-                    ELI.aimbot.fov_color = v;
-                end
-            }):AddColorPicker('aimbot_fov_color2', {
-    Title = 'fov color 2',
-    Default = Color3.fromRGB(255, 255, 255),
-    Callback = function(v)
-        ELI.aimbot.fov_color2 = v;
-    end
-});
-
-            aimbot_tab:AddToggle('aimbot_follow_gunpoint', {
-                Text = 'follow gunpoint',
-                Default = false,
-                Callback = function(v)
-                    ELI.aimbot.follow_gunpoint = v;
-                end
-            });
-            aimbot_tab:AddToggle('aimbot_follow_target', {
-    Text = 'follow target',
-    Default = false,
-    Callback = function(v)
-        ELI.aimbot.follow_target = v;
-    end
-});
-
-            aimbot_tab:AddToggle('aimbot_closest_part', {
-                Text = 'closest part',
-                Default = false,
-                Callback = function(v)
-                    ELI.aimbot.closest_part = v;
-                end
-            });
-
-            aimbot_tab:AddToggle('aimbot_show_fill_enable', {
-                Text = 'show fill',
-                Default = false,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.show_fill = v;
-                    Options.aimbot_fill_transparency:SetVisible(v);
-                end
-            }):AddColorPicker('aimbot_fill_color_primary', {
-                Title = 'fill color',
-                Default = Color3.fromRGB(120, 81, 166),
-                Callback = function(v)
-                    ELI.aimbot.fov_fill_color = v;
-                end
-            }):AddColorPicker('aimbot_fill_color_secondary', {
-                Title = 'fill color 2',
-                Default = Color3.fromRGB(255, 255, 255),
-                Callback = function(v)
-                    ELI.aimbot.fov_fill_color2 = v;
-                end
-            });
-
-            aimbot_tab:AddSlider('aimbot_fov_radius', {
-                Text = 'radius',
-                Default = 180,
-                Suffix = 'px',
-                Min = 1,
-                Max = 600,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.fov_radius = v;
-                end
-            });
-
-            aimbot_tab:AddSlider('aimbot_fill_transparency', {
-                Text = 'fill transparency',
-                Default = 0.6,
-                Min = 0,
-                Max = 1,
-                Rounding = 2,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.fov_fill_transparency = v;
-                end
-            });
-
-            aimbot_tab:AddSlider('aimbot_fov_transparency', {
-                Text = 'fov transparency',
-                Default = 0.2,
-                Min = 0,
-                Max = 1,
-                Rounding = 2,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.fov_outline_transparency = v;
-                end
-            });
-
-            aimbot_tab:AddSlider('aimbot_fov_thickness', {
-                Text = 'thickness',
-                Default = 2,
-                Min = 1,
-                Max = 10,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.fov_thickness = v;
-                end
-            });
-
-            aimbot_tab:AddSlider('aimbot_rotation_speed', {
-                Text = 'rotation speed',
-                Default = 90,
-                Min = 0,
-                Max = 360,
-                Rounding = 0,
-                Visible = false,
-                Callback = function(v)
-                    ELI.aimbot.fov_rotation_speed = v;
-                end
+            aimbot_tab:AddDropdown('aimbot_part', {
+                Text    = 'aim part',
+                Values  = { 'Head', 'HumanoidRootPart', 'UpperTorso', 'HitboxHead' },
+                Default = 1,
+                Multi   = false,
+                Callback = function(v) ELI.aimbot.part = v end
             });
 
             aimbot_tab:AddSlider('aimbot_smoothing', {
-                Text = 'smoothing',
-                Suffix = 's',
-                Default = 1,
-                Min = 0,
-                Max = 1,
+                Text     = 'smoothing',
+                Default  = 0.3,
+                Min      = 0.01,
+                Max      = 1,
                 Rounding = 2,
+                Suffix   = '',
+                Callback = function(v) ELI.aimbot.smoothing = v end
+            });
+
+            aimbot_tab:AddSlider('aimbot_lerp', {
+                Text     = 'lerp',
+                Default  = 0.5,
+                Min      = 0.01,
+                Max      = 1,
+                Rounding = 2,
+                Callback = function(v) ELI.aimbot.lerp = v end
+            });
+
+            aimbot_tab:AddSlider('aimbot_fov_radius', {
+                Text     = 'fov radius',
+                Default  = 200,
+                Min      = 10,
+                Max      = 800,
+                Rounding = 0,
+                Suffix   = 'px',
+                Callback = function(v) ELI.aimbot.fov_radius = v end
+            });
+
+            aimbot_tab:AddSlider('aimbot_max_distance', {
+                Text     = 'max distance',
+                Default  = 500,
+                Min      = 50,
+                Max      = 2000,
+                Rounding = 0,
+                Suffix   = 'st',
+                Callback = function(v) ELI.aimbot.max_distance = v end
+            });
+
+            aimbot_tab:AddToggle('aimbot_show_fov_enable', {
+                Text    = 'show fov',
+                Default = false,
                 Callback = function(v)
-                    ELI.aimbot.smoothing = v;
+                    ELI.aimbot.show_fov = v;
+                    Options.aimbot_fov_radius:SetVisible(v);
+                end
+            }):AddColorPicker('aimbot_fov_color', {
+                Title    = 'fov color',
+                Default  = Color3.fromRGB(255, 255, 255),
+                Callback = function(v) ELI.aimbot.fov_color = v end
+            });
+
+            aimbot_tab:AddToggle('aimbot_team_check', {
+                Text    = 'team check',
+                Default = true,
+                Callback = function(v) ELI.aimbot.team_check = v end
+            });
+
+            aimbot_tab:AddToggle('aimbot_visible_only', {
+                Text    = 'visible only',
+                Default = false,
+                Callback = function(v) ELI.aimbot.visible_only = v end
+            });
+
+            aimbot_tab:AddToggle('aimbot_follow_target', {
+                Text    = 'follow target',
+                Default = true,
+                Callback = function(v) ELI.aimbot.follow_target = v end
+            });
+
+            aimbot_tab:AddToggle('aimbot_closest_part', {
+                Text    = 'closest part',
+                Default = false,
+                Callback = function(v) ELI.aimbot.closest_part = v end
+            });
+
+        end; -- aimbot
+
+        -- ====================================================
+        -- AIMLOCK
+        -- latches onto target, follows every move until dead
+        -- or out of fov — two sub-modes:
+        --   legit : slow lerp + micro-jitter, looks hand-driven
+        --   ghost : faster lerp + sinusoidal drift, hard to clip
+        -- ====================================================
+        local aimlock_tab = aim_tabs:AddTab('aimlock'); do
+
+            aimlock_tab:AddToggle('aimlock_enable', {
+                Text    = 'enable',
+                Default = false,
+                Callback = function(v)
+                    ELI.aimlock.enable = v;
+                    aimlock_active = ELI.aimlock.toggle_hold and false or v;
+                    alfov.Visible  = v and ELI.aimlock.show_fov or false;
+                end
+            }):AddKeyPicker('aimlock_keybind', {
+                Default  = '...',
+                Text     = 'aimlock',
+                NoUI     = false,
+                EnableCheck = function() return ELI.aimlock.enable end,
+                Callback = function(v)
+                    if ELI.aimlock.toggle_hold then
+                        aimlock_active = ELI.aimlock.enable and v;
+                    end;
                 end
             });
 
- aimbot_tab:AddSlider('aimbot_lerp', {
-    Text = 'lerp',
-    Default = 0,
-    Min = 0,
-    Max = 1,
-    Rounding = 2,
-    Callback = function(v)
-        ELI.aimbot.lerp = v;
-    end
-});
-        end;
-    end;
+            aimlock_tab:AddDropdown('aimlock_mode', {
+                Text    = 'mode',
+                Values  = { 'legit', 'ghost' },
+                Default = 'legit',
+                Callback = function(v)
+                    ELI.aimlock.mode = v;
+                    Options.aimlock_smoothing:SetVisible(v == 'legit');
+                    Options.aimlock_shake_x:SetVisible(v == 'legit');
+                    Options.aimlock_shake_y:SetVisible(v == 'legit');
+                    Options.aimlock_ghost_strength:SetVisible(v == 'ghost');
+                end
+            });
 
-    local triggerbot_tab = legit_tab:AddRightGroupbox('triggerbot'); do
-        local keybind_triggerbot_enable = false;
+            aimlock_tab:AddSlider('aimlock_smoothing', {
+                Text     = 'smoothing',
+                Default  = 0.18,
+                Min      = 0.01,
+                Max      = 1,
+                Rounding = 2,
+                Suffix   = '',
+                Callback = function(v) ELI.aimlock.smoothing = v end
+            });
 
-        triggerbot_tab:AddToggle('triggerbot_enable', {
-            Text = 'enable',
-            Default = false,
-            Callback = function(v)
-                keybind_triggerbot_enable = v;
-                ELI.triggerbot.enable = v;
-            end
-        }):AddKeyPicker('triggerbot_keybind', {
-            Default = '...',
-            Text = 'triggerbot',
-            NoUI = false,
-            EnableCheck = function()
-                return ELI.triggerbot.enable;
-            end,
-            Callback = function(v)
-                ELI.triggerbot.enable = keybind_triggerbot_enable and v or false;
-            end
-        });
+            aimlock_tab:AddSlider('aimlock_shake_x', {
+                Text     = 'micro-jitter X',
+                Default  = 0,
+                Min      = 0,
+                Max      = 6,
+                Rounding = 1,
+                Suffix   = 'px',
+                Callback = function(v) ELI.aimlock.shake_x = v end
+            });
 
-        triggerbot_tab:AddToggle('triggerbot_team_check', {
-            Text = 'team check',
-            Default = false,
-            Callback = function(v)
-                ELI.triggerbot.team_check = v;
-            end
-        });
+            aimlock_tab:AddSlider('aimlock_shake_y', {
+                Text     = 'micro-jitter Y',
+                Default  = 0,
+                Min      = 0,
+                Max      = 6,
+                Rounding = 1,
+                Suffix   = 'px',
+                Callback = function(v) ELI.aimlock.shake_y = v end
+            });
 
-        triggerbot_tab:AddSlider('triggerbot_reaction_time', {
-            Text = 'reaction time',
-            Default = 0.05,
-            Min = 0,
-            Max = 2,
-            Rounding = 2,
-            Suffix = 's',
-            Callback = function(v)
-                ELI.triggerbot.reaction_time = v;
-            end
-        });
+            aimlock_tab:AddSlider('aimlock_ghost_strength', {
+                Text     = 'ghost strength',
+                Default  = 0.55,
+                Min      = 0.05,
+                Max      = 1,
+                Rounding = 2,
+                Visible  = false,
+                Callback = function(v) ELI.aimlock.ghost_strength = v end
+            });
 
-        triggerbot_tab:AddSlider('triggerbot_shoot_delay', {
-            Text = 'shoot delay',
-            Default = 0.1,
-            Min = 0,
-            Max = 2,
-            Rounding = 2,
-            Suffix = 's',
-            Callback = function(v)
-                ELI.triggerbot.shoot_delay = v;
-            end
-        });
+            aimlock_tab:AddSlider('aimlock_prediction', {
+                Text     = 'prediction',
+                Default  = 0.08,
+                Min      = 0,
+                Max      = 0.3,
+                Rounding = 3,
+                Suffix   = 's',
+                Callback = function(v) ELI.aimlock.prediction = v end
+            });
 
-        triggerbot_tab:AddSlider('triggerbot_max_distance', {
-            Text = 'max distance',
-            Default = 2500,
-            Min = 1,
-            Max = 2500,
-            Rounding = 0,
-            Suffix = 'studs',
-            Callback = function(v)
-                ELI.triggerbot.max_distance = v;
-            end
-        });
-    end;
+            aimlock_tab:AddSlider('aimlock_max_angle', {
+                Text     = 'max angle',
+                Default  = 45,
+                Min      = 5,
+                Max      = 180,
+                Rounding = 0,
+                Suffix   = '°',
+                Callback = function(v) ELI.aimlock.max_angle = v end
+            });
 
-    local guns_tab = legit_tab:AddRightGroupbox('guns'); do
-        guns_tab:AddToggle('no_muzzle_flash_enable', {
-            Text = 'no muzzle flash',
-            Default = false,
-            Callback = function(v)
-                ELI.guns.no_muzzle_flash = v;
-            end
-        });
+            aimlock_tab:AddSlider('aimlock_fov_radius', {
+                Text     = 'fov radius',
+                Default  = 160,
+                Min      = 10,
+                Max      = 600,
+                Rounding = 0,
+                Suffix   = 'px',
+                Callback = function(v) ELI.aimlock.fov_radius = v end
+            });
 
-        guns_tab:AddToggle('no_spread_enable', {
-            Text = 'no spread',
-            Default = false,
-            Callback = function(v)
-                ELI.guns.no_spread = v;
-            end
-        });
+            aimlock_tab:AddDropdown('aimlock_part', {
+                Text    = 'aim part',
+                Values  = { 'Head', 'HumanoidRootPart', 'HitboxHead' },
+                Default = 'Head',
+                Callback = function(v) ELI.aimlock.part = v end
+            });
 
-        guns_tab:AddToggle('force_modifier_enable', {
-            Text = 'force modifier',
-            Default = false,
-            Callback = function(v)
-                ELI.guns.force_modifier_enable = v;
-                Options.force_modifier_value:SetVisible(v);
-                if v then
-                    for i, item in next, item_lib.Items do
-                        old_force_auto[i] = item.InputSpammingEnabled.StartShooting;
-                    end;
-                else
-                    for i, item in next, item_lib.Items do
-                        item.InputSpammingEnabled.StartShooting = old_force_auto[i];
-                    end;
-                end;
-            end
-        });
+            aimlock_tab:AddToggle('aimlock_team_check', {
+                Text    = 'team check',
+                Default = true,
+                Callback = function(v) ELI.aimlock.team_check = v end
+            });
 
-        guns_tab:AddSlider('force_modifier_value', {
-            Text = '',
-            Suffix = 'x',
-            Default = 0,
-            Min = 0,
-            Max = 1,
-            Rounding = 2,
-            Visible = false,
-            Callback = function(v)
-                ELI.guns.force_modifier_v = v;
-            end
-        });
-    end;
+            aimlock_tab:AddToggle('aimlock_visible_only', {
+                Text    = 'visible only',
+                Default = false,
+                Callback = function(v) ELI.aimlock.only_visible = v end
+            });
 
-    local targeting_tab = legit_tab:AddLeftGroupbox('targeting'); do
-        targeting_tab:AddToggle('visible_only_enable', {
-            Text = 'visible only',
-            Default = false,
-            Callback = function(v)
-                ELI.targeting.visible_only = v;
-            end
-        });
+            aimlock_tab:AddToggle('aimlock_toggle_hold', {
+                Text    = 'hold to lock',
+                Default = false,
+                Callback = function(v)
+                    ELI.aimlock.toggle_hold = v;
+                    if not v then aimlock_active = ELI.aimlock.enable end;
+                end
+            });
 
-        targeting_tab:AddToggle('auto_shoot_enable', {
-            Text = 'auto shoot',
-            Default = false,
-            Callback = function(v)
-                ELI.targeting.auto_shoot = v;
-            end
-        });
+            aimlock_tab:AddToggle('aimlock_show_fov', {
+                Text    = 'show fov',
+                Default = false,
+                Callback = function(v)
+                    ELI.aimlock.show_fov = v;
+                    alfov.Visible = v and ELI.aimlock.enable or false;
+                end
+            }):AddColorPicker('aimlock_fov_color', {
+                Title    = 'fov color',
+                Default  = Color3.fromRGB(80, 200, 120),
+                Callback = function(v)
+                    ELI.aimlock.fov_color = v;
+                    alfov_stroke.Color = v;
+                end
+            });
 
-        local keybind_anti_katana_enable = false;
+        end; -- aimlock
 
-        targeting_tab:AddToggle('anti_katana_enable', {
-            Text = 'anti katana',
-            Default = false,
-            Callback = function(v)
-                keybind_anti_katana_enable = v;
-                ELI.targeting.anti_katana = v;
-            end
-        }):AddKeyPicker('anti_katana_keybind', {
-            Default = '...',
-            Text = 'anti katana',
-            NoUI = false,
-            EnableCheck = function()
-                return ELI.targeting.anti_katana;
-            end,
-            Callback = function(v)
-                ELI.targeting.anti_katana = keybind_anti_katana_enable and v or false;
-            end
-        });
+        -- ====================================================
+        -- TRIGGERBOT
+        -- fires when crosshair is over an enemy — no aim movement
+        -- checks mouse.Target OR raycast from camera center
+        -- ====================================================
+        local triggerbot_tab = aim_tabs:AddTab('triggerbot'); do
 
-        local keybind_anti_riot_shield_enable = false;
+            triggerbot_tab:AddToggle('triggerbot_enable', {
+                Text    = 'enable',
+                Default = false,
+                Callback = function(v)
+                    ELI.triggerbot.enable = v;
+                end
+            }):AddKeyPicker('triggerbot_keybind', {
+                Default  = '...',
+                Text     = 'triggerbot',
+                NoUI     = false,
+                SyncToggleState = false,
+                Mode     = 'Toggle',
+                EnableCheck = function() return ELI.triggerbot.enable end,
+                Callback = function(v)
+                    triggerbot_keybind_active = v;
+                end
+            });
 
-        targeting_tab:AddToggle('anti_riot_shield_enable', {
-            Text = 'anti riot shield',
-            Default = false,
-            Callback = function(v)
-                keybind_anti_riot_shield_enable = v;
-                ELI.silent_aim.riot_shield = v;
-            end
-        }):AddKeyPicker('anti_riot_shield_keybind', {
-            Default = '...',
-            Text = 'anti riot shield',
-            NoUI = false,
-            EnableCheck = function()
-                return ELI.silent_aim.riot_shield;
-            end,
-            Callback = function(v)
-                ELI.silent_aim.riot_shield = keybind_anti_riot_shield_enable and v or false;
-            end
-        });
+            triggerbot_tab:AddDropdown('triggerbot_method', {
+                Text    = 'method',
+                Values  = { 'mouse.Target', 'raycast' },
+                Default = 'mouse.Target',
+                Callback = function(v) ELI.triggerbot.method = v end
+            });
 
-        targeting_tab:AddDropdown('targeting_hit_part', {
-            Values = {'Head', 'HumanoidRootPart', 'UpperTorso', 'LowerTorso'},
-            Default = 1,
-            Multi = false,
-            Text = 'hit part',
-            Callback = function(v)
-                ELI.targeting.part = v;
-            end
-        });
+            triggerbot_tab:AddSlider('triggerbot_reaction_time', {
+                Text     = 'reaction time',
+                Default  = 0,
+                Min      = 0,
+                Max      = 500,
+                Rounding = 0,
+                Suffix   = 'ms',
+                Callback = function(v) ELI.triggerbot.reaction_time = v / 1000 end
+            });
 
-        targeting_tab:AddSlider('max_distance', {
-            Text = 'max distance',
-            Default = 100,
-            Min = 100,
-            Max = 700,
-            Rounding = 0,
-            Callback = function(v)
-                ELI.targeting.max_distance = v;
-            end
-        });
-    end;
-end;
+            triggerbot_tab:AddSlider('triggerbot_shoot_delay', {
+                Text     = 'shoot delay',
+                Default  = 0,
+                Min      = 0,
+                Max      = 300,
+                Rounding = 0,
+                Suffix   = 'ms',
+                Callback = function(v) ELI.triggerbot.shoot_delay = v / 1000 end
+            });
+
+            triggerbot_tab:AddSlider('triggerbot_max_distance', {
+                Text     = 'max distance',
+                Default  = 500,
+                Min      = 50,
+                Max      = 2000,
+                Rounding = 0,
+                Suffix   = 'st',
+                Callback = function(v) ELI.triggerbot.max_distance = v end
+            });
+
+            triggerbot_tab:AddToggle('triggerbot_team_check', {
+                Text    = 'team check',
+                Default = true,
+                Callback = function(v) ELI.triggerbot.team_check = v end
+            });
+
+            triggerbot_tab:AddToggle('triggerbot_require_hold', {
+                Text    = 'require hold (keybind)',
+                Default = false,
+                Callback = function(v) ELI.triggerbot.require_hold = v end
+            });
+
+        end; -- triggerbot
+
+    end; -- aim_tabs
+
+end; -- combat_tab
 
 local PredictionService = {}
 do
