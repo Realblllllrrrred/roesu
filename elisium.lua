@@ -20718,7 +20718,11 @@ do
 
                         script_key = "trial"
 
-                        loadstring(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))()
+                        local _ls = loadstring
+                        if _ls then
+                            local _fn = _ls(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))
+                            if _fn then _fn() end
+                        end
                     ]]);
                 else
                     queueonteleport([[
@@ -20730,7 +20734,11 @@ do
 
                         script_key = "trial"
 
-                        loadstring(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))()
+                        local _ls = loadstring
+                        if _ls then
+                            local _fn = _ls(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))
+                            if _fn then _fn() end
+                        end
                     ]]);
                 end;
             else
@@ -20780,7 +20788,11 @@ do
 
                     script_key = "trial"
 
-                    loadstring(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))()
+                    local _ls = loadstring
+                    if _ls then
+                        local _fn = _ls(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))
+                        if _fn then _fn() end
+                    end
                 ]]);
             else
                 queueonteleport([[
@@ -20792,7 +20804,11 @@ do
 
                     script_key = "trial"
 
-                    loadstring(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))()
+                    local _ls = loadstring
+                    if _ls then
+                        local _fn = _ls(game:HttpGet("https://api.getpolsec.com/scripts/hosted/62a222f303b5c060e8d0a1b93ef272594f00e3a0ec3a1ab1890381cbdbb607f9.lua", true))
+                        if _fn then _fn() end
+                    end
                 ]]);
             end;
         end;
