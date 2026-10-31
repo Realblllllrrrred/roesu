@@ -13322,7 +13322,9 @@ end; end; -- end client_viewmodel.Update hook + nil guard
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     if ELI.auto_vote_map.enable then
-    replicated_storage.Remotes.Duels.Vote:FireServer(ELI.auto_vote_map.map);
+        pcall(function()
+            replicated_storage.Remotes.Duels.Vote:FireServer(ELI.auto_vote_map.map);
+        end);
     end;
 end)));
 
@@ -13417,16 +13419,25 @@ local class_dir = {
     ['melee'] = 3,
     ['utility'] = 4
 };
-for _, item in next, item_lib.Items do
-    local key = item.Class;
-    if not sorted_item_list[key] then
-        sorted_item_list[key] = {};
+if item_lib and item_lib.Items then
+    for _, item in next, item_lib.Items do
+        local key = item.Class;
+        if not sorted_item_list[key] then
+            sorted_item_list[key] = {};
+        end;
+        if item.Name == 'MISSING_WEAPON' then continue end;
+        table.insert(sorted_item_list[key], item.Name);
     end;
-    if item.Name == 'MISSING_WEAPON' then continue end;
-    table.insert(sorted_item_list[key], item.Name);
 end;
 
-local pick_weapons = replicated_storage.Remotes.Replication.Fighter.PickWeapons;
+local pick_weapons;
+pcall(function()
+    pick_weapons = replicated_storage
+        :WaitForChild("Remotes", 10)
+        :WaitForChild("Replication", 10)
+        :WaitForChild("Fighter", 10)
+        :WaitForChild("PickWeapons", 10);
+end);
 trove:Add(task.spawn(LPH_NO_VIRTUALIZE(function()
     while task.wait() do
         if not ELI.auto_loadout.enable then
@@ -13588,7 +13599,9 @@ end; end; -- end PlayHitmarkerSound hook + nil guard
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     if ELI.device_spoof.enable then
-        replicated_storage.Remotes.Replication.Fighter.SetControls:FireServer(ELI.device_spoof.type);
+        pcall(function()
+            replicated_storage.Remotes.Replication.Fighter.SetControls:FireServer(ELI.device_spoof.type);
+        end);
     end;
 end)));
 
@@ -17730,13 +17743,19 @@ local function openCosmeticChanger(showUi)
     unlockAllInitialized = true;
     local replicated_storage = game:GetService("ReplicatedStorage");
     local local_player = game:GetService("Players").LocalPlayer;
-    local enum_library = require(replicated_storage.Modules.EnumLibrary);
-    local cosmetic_lib = require(replicated_storage.Modules.CosmeticLibrary);
-    local data_ctrl = require(local_player.PlayerScripts.Controllers.PlayerDataController);
-    local rep_class = require(replicated_storage.Modules.ReplicatedClass);
-    local item_library = require(replicated_storage.Modules.ItemLibrary);
-    local equip_remote = replicated_storage.Remotes.Data.EquipCosmetic;
-    local fav_remote = replicated_storage.Remotes.Data.FavoriteCosmetic;
+    local rs_mods = replicated_storage:WaitForChild("Modules", 15);
+    if not rs_mods then return end; -- game modules not present, abort init
+    local enum_library = require(rs_mods:WaitForChild("EnumLibrary",    10));
+    local cosmetic_lib = require(rs_mods:WaitForChild("CosmeticLibrary",10));
+    local rep_class    = require(rs_mods:WaitForChild("ReplicatedClass",10));
+    local item_library = require(rs_mods:WaitForChild("ItemLibrary",    10));
+    local ps = local_player:WaitForChild("PlayerScripts", 15);
+    if not ps then return end;
+    local data_ctrl    = require(ps:WaitForChild("Controllers", 10):WaitForChild("PlayerDataController", 10));
+    local rs_remotes   = replicated_storage:WaitForChild("Remotes", 10);
+    local rs_rd        = rs_remotes and rs_remotes:WaitForChild("Data", 10);
+    local equip_remote = rs_rd and rs_rd:WaitForChild("EquipCosmetic",  10);
+    local fav_remote   = rs_rd and rs_rd:WaitForChild("FavoriteCosmetic",10);
     local equipped = {};
     local favorites = {};
     local current_weapon = nil;
