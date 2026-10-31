@@ -5,9 +5,6 @@ loadstring([[
     function LPH_ENCFUNC(f) return f end
 ]])();
 
--- INÍCIO DA CORREÇÃO: Abrimos uma nova thread para resetar o limite de variáveis locais (registradores)
-task.spawn(function()
-
 eli_inext = function(t, i)
     i = i + 1;
     local v = t[i];
@@ -234,7 +231,16 @@ end;
 
 local IsTouchDevice = InputService.TouchEnabled and not InputService.MouseEnabled;
 
-local ProtectGui = protectgui or (syn and syn.protect_gui) or (function() end);
+-- Xeno: protect_gui is a plain global; Synapse X: syn.protect_gui; others: no-op
+local ProtectGui = protectgui
+    or protect_gui
+    or (syn and syn.protect_gui)
+    or (typeof(gethui) == "function" and function(gui)
+        -- fallback: parent to hidden UI container instead of CoreGui
+        -- so the GUI survives detection scans on executors without a protect call
+        pcall(function() gui.Parent = gethui() end)
+    end)
+    or (function() end);
 
 local ScreenGui = Instance.new('ScreenGui');
 ProtectGui(ScreenGui);
@@ -738,7 +744,7 @@ function Library:AddToolTip(InfoStr, HoverInstance)
     });
 
     Library:AddToRegistry(Label, {
-        TextColor3 = 'FontColor';
+        TextColor3 = 'FontColor',
     });
 
     local IsHovering = false;
@@ -3678,7 +3684,7 @@ function Library:CreateVelocityGraphOverlay(Config)
 
         if Length < 0.35 then
             Segment.Visible = false;
-            return;
+            return
         end;
 
         local Angle = math.deg(math.atan2(DeltaY, DeltaX));
@@ -3694,13 +3700,13 @@ function Library:CreateVelocityGraphOverlay(Config)
     local UpdateGraph = LPH_NO_VIRTUALIZE(function()
         if not Overlay.Visible or not Overlay.Outer or not Overlay.Outer.Visible then
             SetGraphVisible(false);
-            return;
+            return
         end;
 
         local Root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart');
         if not Root then
             SetGraphVisible(false);
-            return;
+            return
         end;
 
         local GraphWidth = math.max(math.floor(GraphArea.AbsoluteSize.X + 0.5), BoxWidth);
@@ -5058,7 +5064,7 @@ do
             function SubButton:SetText(text)
                 self.Text = text;
                 self.Label.Text = text;
-                return SubButton;
+                return self;
             end;
 
             if type(SubButton.Tooltip) == 'string' then
@@ -6978,7 +6984,10 @@ task.spawn(function()
 
     local function getExecutor()
         if execName ~= nil then return execName end;
-        local fn = identifyexecutor or getexecutorname;
+        -- identifyexecutor  → Synapse X, KRNL, Fluxus
+        -- getexecutorname   → Xeno, Codex, Wave, Arceus
+        -- executor_name     → some mobile forks (plain string global)
+        local fn = identifyexecutor or getexecutorname or getexecname;
         if fn then
             local ok, name, ver = pcall(fn);
             if ok and name then
@@ -6987,6 +6996,8 @@ task.spawn(function()
             else
                 execName = "";
             end;
+        elseif type(executor_name) == "string" and executor_name ~= "" then
+            execName = executor_name;
         else
             execName = "";
         end;
@@ -8888,7 +8899,7 @@ local SaveManager = (function()
             if self.Library.Options.ThemeManager_ThemeList and self.Library.Options.ThemeManager_ThemeList.Value then
                 data.theme.preset = self.Library.Options.ThemeManager_ThemeList.Value;
             end;
-        end;
+        end
 
         do
             data.widgets = {};
@@ -9255,40 +9266,96 @@ end;
 local local_player = players.LocalPlayer;
 local camera = workspace.CurrentCamera;
 local mouse = cloneref(local_player:GetMouse());
-local modules = replicated_storage.Modules;
-local first_person = workspace.ViewModels.FirstPerson;
-local utility = require(modules.Utility);
-local enum_lib = require(modules.EnumLibrary);
-local item_lib = require(modules.ItemLibrary);
-local cosmetic_lib = require(modules.CosmeticLibrary);
-local data_ctrl = require(local_player.PlayerScripts.Controllers.PlayerDataController);
-local rep_class = require(replicated_storage.Modules.ReplicatedClass);
-local equip_remote = replicated_storage.Remotes.Data.EquipCosmetic;
-local fav_remote = replicated_storage.Remotes.Data.FavoriteCosmetic;
-local finishers = replicated_storage.Modules.Finishers;
-local gun = require(local_player.PlayerScripts.Modules.ItemTypes.Gun);
-local katana = require(local_player.PlayerScripts.Modules.Items.Katana);
-local fighter_controller = require(local_player.PlayerScripts.Controllers.FighterController);
-local camera_controller = require(local_player.PlayerScripts.Controllers.CameraController);
-local mechanics_controller = require(local_player.PlayerScripts.Controllers.MechanicsController);
-local tracer_effect = require(local_player.PlayerScripts.Modules.TracerEffect);
-local pages = require(local_player.PlayerScripts.Modules.UserInterface.Pages);
-local client_entity = require(local_player.PlayerScripts.Modules.ClientReplicatedClasses.ClientEntity);
-local client_viewmodel = require(local_player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem.ClientViewModel);
-local duel_controller = require(local_player.PlayerScripts.Controllers.DuelController);
-local client_item = require(local_player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem);
-local controls_controller = require(local_player.PlayerScripts.Controllers.ControlsController);
-local player_data_controller = require(local_player.PlayerScripts.Controllers.PlayerDataController);
-local equipment_state = require(local_player.PlayerScripts.Modules.UserInterface.Equipment.Interface.Customize.Options);
-local cosmetic_state = require(local_player.PlayerScripts.Modules.UserInterface.Equipment.Interface.Customize.Cosmetics);
-local cosmetic_inventory = player_data_controller:Get('CosmeticInventory');
-local finisher = require(local_player.PlayerScripts.Modules.UserInterface.Equipment.Scene.FinisherPlayer);
-local local_fighter = fighter_controller.LocalFighter;
-local in_match = local_fighter:Get("IsInDuel") == true;
+-- Game-specific module requires wrapped in pcall.
+-- WaitForChild with timeout returns nil (not error) so we must not chain off the result.
+-- If any require fails (wrong game, baseplate, slow replication) the variable stays nil
+-- and the feature that needs it fails silently via the existing pcall guards below.
+local modules, first_person, utility, enum_lib, item_lib, cosmetic_lib;
+local data_ctrl, rep_class, equip_remote, fav_remote, finishers, gun;
+local katana, fighter_controller, camera_controller, mechanics_controller;
+local tracer_effect, pages, client_entity, client_viewmodel;
+local duel_controller, client_item, controls_controller, player_data_controller;
+local equipment_state, cosmetic_state, cosmetic_inventory, finisher;
+local local_fighter, in_match;
+
+pcall(function()
+    -- wait for top-level containers first; abort early if they don't exist
+    local ps = local_player:WaitForChild("PlayerScripts", 15);
+    if not ps then return end;
+    local rs_modules = replicated_storage:WaitForChild("Modules", 15);
+    if not rs_modules then return end;
+
+    modules       = rs_modules;
+    local vm_folder = workspace:WaitForChild("ViewModels", 10);
+    first_person  = vm_folder and vm_folder:WaitForChild("FirstPerson", 10);
+
+    utility       = require(modules:WaitForChild("Utility",        10));
+    enum_lib      = require(modules:WaitForChild("EnumLibrary",    10));
+    item_lib      = require(modules:WaitForChild("ItemLibrary",    10));
+    cosmetic_lib  = require(modules:WaitForChild("CosmeticLibrary",10));
+    rep_class     = require(modules:WaitForChild("ReplicatedClass",10));
+    finishers     = modules:WaitForChild("Finishers", 10);
+
+    local remotes = replicated_storage:WaitForChild("Remotes", 10);
+    if remotes then
+        local rd = remotes:WaitForChild("Data", 10);
+        if rd then
+            equip_remote = rd:WaitForChild("EquipCosmetic",  10);
+            fav_remote   = rd:WaitForChild("FavoriteCosmetic",10);
+        end;
+    end;
+
+    local ps_modules     = ps:WaitForChild("Modules",     10);
+    local ps_controllers = ps:WaitForChild("Controllers", 10);
+
+    if ps_modules then
+        local item_types = ps_modules:WaitForChild("ItemTypes", 10);
+        gun            = item_types and require(item_types:WaitForChild("Gun",    10));
+        local items    = ps_modules:WaitForChild("Items", 10);
+        katana         = items     and require(items:WaitForChild("Katana",       10));
+        tracer_effect  = require(ps_modules:WaitForChild("TracerEffect",          10));
+        client_entity  = require(ps_modules:WaitForChild("ClientReplicatedClasses",10)
+                            :WaitForChild("ClientEntity", 10));
+        local cfc = ps_modules.ClientReplicatedClasses
+                        :WaitForChild("ClientFighter", 10);
+        if cfc then
+            local ci = cfc:WaitForChild("ClientItem", 10);
+            client_item      = ci and require(ci);
+            client_viewmodel = ci and require(ci:WaitForChild("ClientViewModel", 10));
+        end;
+        local ui = ps_modules:WaitForChild("UserInterface", 10);
+        if ui then
+            pages          = require(ui:WaitForChild("Pages", 10));
+            local eq = ui:WaitForChild("Equipment", 10);
+            if eq then
+                local iface    = eq:WaitForChild("Interface", 10);
+                local cust     = iface and iface:WaitForChild("Customize", 10);
+                equipment_state  = cust and require(cust:WaitForChild("Options",   10));
+                cosmetic_state   = cust and require(cust:WaitForChild("Cosmetics", 10));
+                local scene    = eq:WaitForChild("Scene", 10);
+                finisher       = scene and require(scene:WaitForChild("FinisherPlayer", 10));
+            end;
+        end;
+    end;
+
+    if ps_controllers then
+        fighter_controller    = require(ps_controllers:WaitForChild("FighterController",   10));
+        camera_controller     = require(ps_controllers:WaitForChild("CameraController",    10));
+        mechanics_controller  = require(ps_controllers:WaitForChild("MechanicsController", 10));
+        duel_controller       = require(ps_controllers:WaitForChild("DuelController",      10));
+        controls_controller   = require(ps_controllers:WaitForChild("ControlsController",  10));
+        player_data_controller= require(ps_controllers:WaitForChild("PlayerDataController",10));
+        data_ctrl             = player_data_controller;
+    end;
+
+    cosmetic_inventory = player_data_controller and player_data_controller:Get("CosmeticInventory");
+    local_fighter      = fighter_controller and fighter_controller.LocalFighter;
+    in_match           = local_fighter and local_fighter:Get("IsInDuel") == true;
+end);
 local trove = GLOBAL_TROVE;
 local new_drawing = Drawing.new;
 local old_force_auto = {};
-local old_jump_fist = mechanics_controller._original_jump_power;
+local old_jump_fist = mechanics_controller and mechanics_controller._original_jump_power;
 local oldoffsets = {};
 local clickedontheremote = false;
 local was_i_in_a_match = false;
@@ -10206,7 +10273,18 @@ do
 ]==];
     local http = game:GetService("HttpService");
     local function get_setter()
-        return setfflag or set_fflag or (syn and syn.set_fflag) or (getgenv() and getgenv().setfflag);
+        -- setfflag        → KRNL, Fluxus, Delta
+        -- set_fflag       → Arceus, Trigon, Codex
+        -- setflag         → Xeno
+        -- set_fast_flag   → Wave, Hydrogen
+        -- syn.set_fflag   → Synapse X
+        -- getgenv().setfflag → injected by some loader scripts
+        return setfflag
+            or set_fflag
+            or setflag
+            or set_fast_flag
+            or (syn and syn.set_fflag)
+            or (getgenv() and getgenv().setfflag);
     end;
     getgenv().elisium_fflag_preset = FFLAG_PRESET;
     getgenv().elisium_inject_fflags = function(json_str)
@@ -12137,7 +12215,8 @@ function create_beam(from, to, lerp_override)
 end;
 end;
 
-local old_tracer = tracer_effect.Play; tracer_effect.Play = function(...)
+local old_tracer = tracer_effect and tracer_effect.Play;
+if old_tracer then tracer_effect.Play = function(...)
     local args = {...};
     if ELI.silent_aim.visualize and ELI.silent_aim.enable
         and args[2] and args[2].IsLocal and args[2].RaycastResults then
@@ -12162,13 +12241,18 @@ local old_tracer = tracer_effect.Play; tracer_effect.Play = function(...)
         end;
     end;
     return old_tracer(...);
+end; end; -- end tracer_effect.Play hook + nil guard
+
+if tracer_effect and old_tracer then
+    trove:Add(function()
+        tracer_effect.Play = old_tracer;
+    end);
 end;
 
-trove:Add(function()
-    tracer_effect.Play = old_tracer;
-end);
-
 function GetMuzzlePos()
+    if not first_person then
+        return Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2);
+    end;
     for M,P in first_person:GetDescendants() do
         if P.Name == "_muzzle" and P:IsA("Attachment") then
             local Pos = camera:WorldToViewportPoint(P.WorldPosition);
@@ -12225,7 +12309,7 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     if not s_show and not a_show then
         if sfov.Visible then sfov.Visible = false end;
         if afov.Visible then afov.Visible = false end;
-        return;
+        return
     end;
 
     fov_rotation = (fov_rotation + ELI.silent_aim.fov_rotation_speed * dt) % 360;
@@ -12466,7 +12550,7 @@ trove:Add(run_service.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
 end)));
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
-    if ELI.third_person.enable then
+    if ELI.third_person.enable and camera_controller and camera_controller.CameraState then
         if camera_controller.CameraState:GetPublicState() ~= camera_controller.CameraState.States.ThirdPerson then
             camera_controller.CameraState:TogglePOV();
         end;
@@ -12751,7 +12835,7 @@ do
             if next(body_tracked) then vmc_restore(body_tracked) end;
             if next(item_tracked) then vmc_restore(item_tracked) end;
             if next(clothes_tracked) then vmc_restore_clothes() end;
-            return;
+            return
         end;
 
         local now = tick();
@@ -13167,7 +13251,8 @@ function hookanim(vm)
         return orig(self, key, ...);
     end;
 end;
-local old_update = client_viewmodel.Update; client_viewmodel.Update = function(c, dt, movement_state, render_data)
+local old_update = client_viewmodel and client_viewmodel.Update;
+if old_update then client_viewmodel.Update = function(c, dt, movement_state, render_data)
     if c.ClientItem.ClientFighter.IsLocalPlayer then
         hookanim(c);
 
@@ -13233,7 +13318,7 @@ local old_update = client_viewmodel.Update; client_viewmodel.Update = function(c
     end;
 
     return old_update(c, dt, movement_state, render_data);
-end;
+end; end; -- end client_viewmodel.Update hook + nil guard
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     if ELI.auto_vote_map.enable then
@@ -13300,7 +13385,7 @@ end;
 trove:Add(task.spawn(function()
     while wait(1) do
         if ELI.auto_queue.enable and ELI.auto_queue.queue_mode ~= "" then
-            local fighter = fighter_controller.LocalFighter;
+            local fighter = fighter_controller and fighter_controller.LocalFighter;
             local currently_in_match = false;
             pcall(function()
                 currently_in_match = fighter ~= nil and fighter:Get("IsInDuel") == true;
@@ -13348,7 +13433,7 @@ trove:Add(task.spawn(LPH_NO_VIRTUALIZE(function()
             continue;
         end;
         local loadout = ELI.auto_loadout.loadout;
-        local current_page = pages.PageSystem.CurrentPage;
+        local current_page = pages and pages.PageSystem and pages.PageSystem.CurrentPage;
         if local_fighter and local_fighter:Get('CanPickWeapons') == true then
             if not current_page then continue end;
             if current_page.Name ~= 'PickWeapons' then continue end;
@@ -13431,7 +13516,8 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     end;
 end)));
 
-local replicate_from_server = local_fighter.ReplicateFromServer; local_fighter.ReplicateFromServer = function(controller, _type, ...)
+local replicate_from_server = local_fighter and local_fighter.ReplicateFromServer;
+if replicate_from_server then local_fighter.ReplicateFromServer = function(controller, _type, ...)
     if _type == 'DamageNumberEffect' then
         local hit_root, hit_damage, is_headshot = unpack({...});
         if not hit_root or not hit_damage then
@@ -13478,9 +13564,10 @@ local replicate_from_server = local_fighter.ReplicateFromServer; local_fighter.R
         end;
     end;
     return replicate_from_server(controller, _type, ...);
-end;
+end; end; -- end ReplicateFromServer hook + nil guard
 
-local play_hitmarker_sound = client_viewmodel.PlayHitmarkerSound; client_viewmodel.PlayHitmarkerSound = function(controller, critical, pitch)
+local play_hitmarker_sound = client_viewmodel and client_viewmodel.PlayHitmarkerSound;
+if play_hitmarker_sound then client_viewmodel.PlayHitmarkerSound = function(controller, critical, pitch)
     if ELI.custom_hitsounds.enable then
         if ELI.custom_hitsounds.selected and hitsound_dir[ELI.custom_hitsounds.selected] then
             local hitsound = hitsound_dir[ELI.custom_hitsounds.selected];
@@ -13497,7 +13584,7 @@ local play_hitmarker_sound = client_viewmodel.PlayHitmarkerSound; client_viewmod
     end;
 
     return play_hitmarker_sound(controller, critical, pitch);
-end;
+end; end; -- end PlayHitmarkerSound hook + nil guard
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     if ELI.device_spoof.enable then
@@ -13506,13 +13593,13 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
 end)));
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
-    if ELI.sound_spammer.enable then
+    if ELI.sound_spammer.enable and mechanics_controller then
         mechanics_controller:PlayMechanicsSound(ELI.sound_spammer.type);
     end;
 end)));
 
 trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
-    if ELI.targeting.auto_shoot then
+    if ELI.targeting.auto_shoot and local_fighter then
         local target = getclosest();
         if (target and target.Character) then
             setthreadidentity(2);
@@ -13522,7 +13609,8 @@ trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
     end;
 end)));
 
-local old = katana._StartDeflecting; katana._StartDeflecting = function(...)
+local old = katana and katana._StartDeflecting;
+if old then katana._StartDeflecting = function(...)
     local args = {...};
     local fighter = args[1].ClientFighter;
     local player = fighter and fighter.Player;
@@ -13533,10 +13621,11 @@ local old = katana._StartDeflecting; katana._StartDeflecting = function(...)
         end);
     end;
     return old(table.unpack(args));
-end;
+end; end; -- end katana hook + nil guard
 
 local items_backup = {};
-local old = gun.StartShooting; gun.StartShooting = function(controller, is_empty, debounce)
+local old = gun and gun.StartShooting;
+if old then gun.StartShooting = function(controller, is_empty, debounce)
     local client_fighter = controller.ClientFighter;
     if not client_fighter.Islocal_player then
         return old(controller, is_empty, debounce);
@@ -13552,24 +13641,30 @@ local old = gun.StartShooting; gun.StartShooting = function(controller, is_empty
         end;
     end;
     return unpack(shoot_result);
+end; end; -- end gun.StartShooting hook + nil guard
+
+if katana and old then
+    trove:Add(function()
+        katana._StartDeflecting = old;
+    end);
 end;
 
-trove:Add(function()
-    katana._StartDeflecting = old;
-end);
-
-local old_muzzle = utility.PlayParticles; utility.PlayParticles = function(s, p)
+local old_muzzle = utility and utility.PlayParticles;
+if old_muzzle then utility.PlayParticles = function(s, p)
     if ELI.guns.no_muzzle_flash and p.Name == "_muzzle" then
         return;
     end;
     return old_muzzle(s, p);
+end; end;
+
+if utility and old_muzzle then
+    trove:Add(function()
+        utility.PlayParticles = old_muzzle;
+    end);
 end;
 
-trove:Add(function()
-    utility.PlayParticles = old_muzzle;
-end);
-
-local old_raycast = utility.Raycast; utility.Raycast = LPH_NO_VIRTUALIZE(function(...)
+local old_raycast = utility and utility.Raycast;
+if old_raycast then utility.Raycast = LPH_NO_VIRTUALIZE(function(...)
     if ELI.silent_aim.enable and debug.info(3, "n") == "StartShooting" then
         if math.random(1, 100) <= ELI.silent_aim.hit_chance then
             local closest = getclosest();
@@ -13597,11 +13692,13 @@ local old_raycast = utility.Raycast; utility.Raycast = LPH_NO_VIRTUALIZE(functio
         end;
     end;
     return old_raycast(...);
-end);
+end); end; -- end utility.Raycast hook + nil guard
 
-trove:Add(function()
-    utility.Raycast = old_raycast;
-end);
+if utility and old_raycast then
+    trove:Add(function()
+        utility.Raycast = old_raycast;
+    end);
+end;
 
 local legit_tab = Tabs.Main; do
     local aim_tabs = legit_tab:AddLeftTabbox(); do
@@ -14314,7 +14411,7 @@ do
     PredictionService:Init();
 end;
 
-local DesyncService = {};
+local DesyncService = {}
 do
     function DesyncService:Init()
         self.active = false;
@@ -14323,15 +14420,15 @@ do
         self.client = nil;
         self.angle = 0;
         self.speed = 9000;
-        self.fighter = fighter_controller.LocalFighter;
+        self.fighter = fighter_controller and fighter_controller.LocalFighter;
 
-        local ref = camera_controller.Update;
-        camera_controller.Update = function(...)
+        local ref = camera_controller and camera_controller.Update;
+        if ref then camera_controller.Update = function(...)
             if self.active and self.fighter and self.fighter.Entity.RootPart and self.client then
                 self.fighter.Entity.RootPart.CFrame = self.client;
             end;
             return ref(...);
-        end;
+        end; end;
     end;
 
     function DesyncService:Start(target)
@@ -14496,7 +14593,7 @@ do
     trove:Add(clearPool);
 end;
 
-local RagebotService = {};
+local RagebotService = {}
 do
     function RagebotService:Init()
         self.active = false;
@@ -14882,10 +14979,12 @@ do
     local exec_label = ff_box:AddLabel('detecting your executor', true)
     do
         local name = '';
-        local fn = identifyexecutor or getexecutorname;
+        local fn = identifyexecutor or getexecutorname or getexecname;
         if fn then
             local ok, n = pcall(fn);
             if ok and n then name = tostring(n) end;
+        elseif type(executor_name) == "string" and executor_name ~= "" then
+            name = executor_name;
         end;
         local key = string.lower(name);
 
@@ -17766,7 +17865,8 @@ local function openCosmeticChanger(showUi)
             end;
         end;
     end;
-    local old = data_ctrl.Get; data_ctrl.Get = function(self, data_key)
+    local old = data_ctrl and data_ctrl.Get;
+    if old then data_ctrl.Get = function(self, data_key)
         local original = old(self, data_key);
         if not enabled then return original end;
         if data_key == "CosmeticInventory" then
@@ -17793,8 +17893,9 @@ local function openCosmeticChanger(showUi)
             return fav;
         end;
         return original;
-    end;
-    local old = data_ctrl.GetWeaponData; data_ctrl.GetWeaponData = function(self, weapon_name)
+    end; end; -- end data_ctrl.Get hook + nil guard
+    local old = data_ctrl and data_ctrl.GetWeaponData;
+    if old then data_ctrl.GetWeaponData = function(self, weapon_name)
         local weapon_data = old(self, weapon_name);
         if not weapon_data then return nil end;
         local final = table.clone(weapon_data);
@@ -17808,8 +17909,16 @@ local function openCosmeticChanger(showUi)
             end;
         end;
         return final;
-    end;
-    local client_item_module = require(local_player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem);
+    end; end; -- end data_ctrl.GetWeaponData hook + nil guard
+    local client_item_module;
+    pcall(function()
+        local ps = local_player:FindFirstChild("PlayerScripts");
+        local path = ps and ps:FindFirstChild("Modules")
+            and ps.Modules:FindFirstChild("ClientReplicatedClasses")
+            and ps.Modules.ClientReplicatedClasses:FindFirstChild("ClientFighter")
+            and ps.Modules.ClientReplicatedClasses.ClientFighter:FindFirstChild("ClientItem");
+        if path then client_item_module = require(path) end;
+    end);
     if client_item_module and client_item_module._CreateViewModel then
         local old = client_item_module._CreateViewModel; client_item_module._CreateViewModel = function(self, vm_ref)
             local weapon_name = self.Name;
@@ -19425,7 +19534,7 @@ end)()
     trove:Add(run_service.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
         if not cfg.chams.enable then
             if next(highlights) or next(body_parts) then clear_chams() end;
-            return;
+            return
         end;
         local now = tick();
         if now - chams_last < 0.2 then return end;
@@ -21211,7 +21320,9 @@ end)()
         toggleGui.ZIndexBehavior = Enum.ZIndexBehavior.Global;
         toggleGui.DisplayOrder = 100000;
         pcall(function()
-            if syn and syn.protect_gui then syn.protect_gui(toggleGui); end;
+            -- protect_gui: Xeno (global), Synapse X (syn.protect_gui), others ignored
+            local _pg = protect_gui or (syn and syn.protect_gui);
+            if _pg then pcall(_pg, toggleGui) end;
         end);
         local parented = pcall(function()
             toggleGui.Parent = (gethui and gethui()) or cloneref(game:GetService('CoreGui'));
@@ -21320,4 +21431,4 @@ pcall(function() SaveManager:LoadAutoloadConfig() end);
 
 end;
 end;
-end)
+end
